@@ -1,0 +1,16 @@
+.env
+updated.env
+__pycache__/
+*.pyc
+
+# Source data workbooks / BI files — personal score & handicap data, not for a public repo
+*.xlsx
+*.pbix
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code local session/runtime state (machine-specific, not project config)
+.claude/settings.local.json
+.claude/scheduled_tasks.lock

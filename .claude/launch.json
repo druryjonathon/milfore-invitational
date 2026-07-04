@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "milfore-history-app",
+      "runtimeExecutable": "C:\\Windows\\System32\\cmd.exe",
+      "runtimeArgs": ["/c", "set PATH=C:\\PROGRA~1\\nodejs;%PATH% && npm run dev --prefix app -- --port 5173"],
+      "port": 5173
+    }
+  ]
+}
