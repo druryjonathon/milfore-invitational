@@ -45,21 +45,20 @@ export function RoundDetail() {
           <div className="course-hero">
             <div className="course-hero-name">{data.round.event_name}</div>
             <div className="course-hero-sub">
-              {data.round.course_name} · {data.round.tee_color ?? ""} · Round {data.round.round_number}
+              {[data.round.course_name, data.round.tee_color, `Round ${data.round.round_number}`].filter(Boolean).join(" · ")}
             </div>
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", marginTop: 14, gap: 8 }}>
+            <div className="course-hero-sub" style={{ marginTop: 2 }}>
+              {data.round.format_name}
+            </div>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", marginTop: 14, gap: 8 }}>
               <div className="course-stat">
                 <div className="course-stat-v">{data.round.course_par ?? "—"}</div>
                 <div className="course-stat-l">Par</div>
               </div>
               <div className="course-stat">
-                <div className="course-stat-v">{data.round.format_name}</div>
-                <div className="course-stat-l" style={{ fontSize: 8 }}>
-                  Format
+                <div className="course-stat-v" style={{ fontSize: 16 }}>
+                  {data.round.scoring_type}
                 </div>
-              </div>
-              <div className="course-stat">
-                <div className="course-stat-v">{data.round.scoring_type}</div>
                 <div className="course-stat-l">Scoring</div>
               </div>
             </div>
