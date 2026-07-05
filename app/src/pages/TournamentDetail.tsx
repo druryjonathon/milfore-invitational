@@ -1,22 +1,66 @@
 import { useState } from "react";
 import { Link, useParams } from "react-router-dom";
+import {
+  ResponsiveContainer,
+  LineChart,
+  Line,
+  BarChart,
+  Bar,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  Legend,
+  Cell,
+} from "recharts";
 import { BackLink } from "../components/BackLink";
 import { SectionHeader } from "../components/SectionHeader";
 import { Tabs } from "../components/Tabs";
 import { LoadingState, ErrorState, EmptyState } from "../components/StatusStates";
 import { useQuery } from "../lib/useQuery";
-import { getTournamentByYear, getTeamStandings, getRoundsForTournament, getTeamRoster } from "../lib/queries";
+import {
+  getTournamentByYear,
+  getTeamStandings,
+  getRoundsForTournament,
+  getTeamRoster,
+  getTeamPointsByRound,
+  getIndividualPointsForTournament,
+  type TeamRoundPoints,
+} from "../lib/queries";
+import { CHART_COLORS, CHART_GRID_COLOR, CHART_AXIS_COLOR, CHART_FONT, tooltipStyle } from "../lib/chartTheme";
 
-type Tab = "standings" | "rounds" | "teams";
+type Tab = "standings" | "rounds" | "teams" | "analytics";
 
 async function loadTournament(year: number) {
   const tournament = await getTournamentByYear(year);
-  const [standings, rounds, roster] = await Promise.all([
+  const [standings, rounds, roster, pointsByRound, individualPoints] = await Promise.all([
     getTeamStandings(tournament.tournament_id),
     getRoundsForTournament(tournament.tournament_id),
     getTeamRoster(tournament.tournament_id),
+    getTeamPointsByRound(tournament.tournament_id),
+    getIndividualPointsForTournament(tournament.tournament_id),
   ]);
-  return { tournament, standings, rounds, roster };
+  return { tournament, standings, rounds, roster, pointsByRound, individualPoints };
+}
+
+function pivotByRound(rows: TeamRoundPoints[], teamNames: string[], cumulative: boolean) {
+  const roundNumbers = [...new Set(rows.map((r) => r.round_number))].sort((a, b) => a - b);
+  const running = new Map<string, number>();
+  return roundNumbers.map((rn) => {
+    const point: Record<string, number | string> = { round: `R${rn}` };
+    for (const teamName of teamNames) {
+      const row = rows.find((r) => r.round_number === rn && r.team_name === teamName);
+      const val = row?.points ?? 0;
+      if (cumulative) {
+        const next = (running.get(teamName) ?? 0) + val;
+        running.set(teamName, next);
+        point[teamName] = next;
+      } else {
+        point[teamName] = val;
+      }
+    }
+    return point;
+  });
 }
 
 export function TournamentDetail() {
@@ -42,6 +86,7 @@ export function TournamentDetail() {
               { id: "standings", label: "Standings" },
               { id: "rounds", label: "Rounds" },
               { id: "teams", label: "Teams" },
+              { id: "analytics", label: "Analytics" },
             ]}
           />
 
@@ -107,6 +152,100 @@ export function TournamentDetail() {
                   </div>
                 );
               });
+            })()}
+
+          {tab === "analytics" &&
+            (() => {
+              const teamNames = data.standings.map((s) => s.team_name);
+              const colorByTeam = new Map(teamNames.map((name, i) => [name, CHART_COLORS[i % CHART_COLORS.length]]));
+
+              if (data.pointsByRound.length === 0 && data.individualPoints.length === 0) {
+                return <EmptyState label="No results recorded yet to chart." />;
+              }
+
+              const cumulativeData = pivotByRound(data.pointsByRound, teamNames, true);
+              const perRoundData = pivotByRound(data.pointsByRound, teamNames, false);
+
+              return (
+                <>
+                  {cumulativeData.length > 0 && (
+                    <div className="card">
+                      <div className="card-inner">
+                        <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 8 }}>Points Race — Cumulative by Round</div>
+                        <ResponsiveContainer width="100%" height={220}>
+                          <LineChart data={cumulativeData} margin={{ top: 4, right: 8, left: -20, bottom: 0 }}>
+                            <CartesianGrid stroke={CHART_GRID_COLOR} vertical={false} />
+                            <XAxis dataKey="round" tick={{ fontSize: 11, fontFamily: CHART_FONT, fill: CHART_AXIS_COLOR }} />
+                            <YAxis tick={{ fontSize: 11, fontFamily: CHART_FONT, fill: CHART_AXIS_COLOR }} />
+                            <Tooltip {...tooltipStyle} />
+                            <Legend wrapperStyle={{ fontSize: 11, fontFamily: CHART_FONT }} />
+                            {teamNames.map((name) => (
+                              <Line
+                                key={name}
+                                type="monotone"
+                                dataKey={name}
+                                stroke={colorByTeam.get(name)}
+                                strokeWidth={2}
+                                dot={{ r: 3 }}
+                              />
+                            ))}
+                          </LineChart>
+                        </ResponsiveContainer>
+                      </div>
+                    </div>
+                  )}
+
+                  {perRoundData.length > 0 && (
+                    <div className="card">
+                      <div className="card-inner">
+                        <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 8 }}>Points Earned by Round</div>
+                        <ResponsiveContainer width="100%" height={220}>
+                          <BarChart data={perRoundData} margin={{ top: 4, right: 8, left: -20, bottom: 0 }}>
+                            <CartesianGrid stroke={CHART_GRID_COLOR} vertical={false} />
+                            <XAxis dataKey="round" tick={{ fontSize: 11, fontFamily: CHART_FONT, fill: CHART_AXIS_COLOR }} />
+                            <YAxis tick={{ fontSize: 11, fontFamily: CHART_FONT, fill: CHART_AXIS_COLOR }} />
+                            <Tooltip {...tooltipStyle} />
+                            <Legend wrapperStyle={{ fontSize: 11, fontFamily: CHART_FONT }} />
+                            {teamNames.map((name) => (
+                              <Bar key={name} dataKey={name} fill={colorByTeam.get(name)} radius={[3, 3, 0, 0]} />
+                            ))}
+                          </BarChart>
+                        </ResponsiveContainer>
+                      </div>
+                    </div>
+                  )}
+
+                  {data.individualPoints.length > 0 && (
+                    <div className="card">
+                      <div className="card-inner">
+                        <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 8 }}>Who Earned the Points</div>
+                        <ResponsiveContainer width="100%" height={Math.max(180, data.individualPoints.length * 32)}>
+                          <BarChart
+                            data={data.individualPoints}
+                            layout="vertical"
+                            margin={{ top: 4, right: 16, left: -8, bottom: 0 }}
+                          >
+                            <CartesianGrid stroke={CHART_GRID_COLOR} horizontal={false} />
+                            <XAxis type="number" tick={{ fontSize: 11, fontFamily: CHART_FONT, fill: CHART_AXIS_COLOR }} />
+                            <YAxis
+                              type="category"
+                              dataKey="display_name"
+                              width={90}
+                              tick={{ fontSize: 11, fontFamily: CHART_FONT, fill: CHART_AXIS_COLOR }}
+                            />
+                            <Tooltip {...tooltipStyle} />
+                            <Bar dataKey="points" radius={[0, 3, 3, 0]}>
+                              {data.individualPoints.map((p) => (
+                                <Cell key={p.player_id} fill={colorByTeam.get(p.team_name ?? "") ?? CHART_COLORS[0]} />
+                              ))}
+                            </Bar>
+                          </BarChart>
+                        </ResponsiveContainer>
+                      </div>
+                    </div>
+                  )}
+                </>
+              );
             })()}
         </>
       )}
