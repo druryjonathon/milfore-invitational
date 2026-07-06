@@ -37,6 +37,26 @@ export async function getAllTeamStandings(): Promise<TeamStanding[]> {
   return data ?? [];
 }
 
+export interface TournamentCourses {
+  tournament_id: number;
+  course_names: string[];
+}
+
+export async function getTournamentCourseNames(): Promise<TournamentCourses[]> {
+  const { data, error } = await supabase.from("rounds").select("tournament_id, round_number, courses(course_name)").order("round_number");
+  if (error) throw error;
+
+  const byTournament = new Map<number, string[]>();
+  for (const row of (data ?? []) as any[]) {
+    const name = row.courses?.course_name;
+    if (!name) continue;
+    const list = byTournament.get(row.tournament_id) ?? [];
+    if (!list.includes(name)) list.push(name);
+    byTournament.set(row.tournament_id, list);
+  }
+  return [...byTournament.entries()].map(([tournament_id, course_names]) => ({ tournament_id, course_names }));
+}
+
 export async function getTeamStandings(tournamentId: number): Promise<TeamStanding[]> {
   const { data, error } = await supabase
     .from("v_team_standings")
@@ -562,21 +582,110 @@ export async function getPlayerFinishDistribution(playerId: number): Promise<Fin
 
 // ── Records ──
 
-interface RecordsRow {
-  display_name: string;
+interface FormatRecordRawRow {
+  match_id: number;
+  round_id: number;
   gross_strokes: number | null;
   event_score: number | null;
-  tournament_points: number | null;
   event_name: string;
   scoring_type: string;
+  grouping_size: number;
   year: number;
 }
 
-function classifyFormat(eventName: string): string {
+// Normalizes a round's display event_name into the "same recurring event"
+// bucket a human would recognize (e.g. "Scramble (1/4's & 2/3's)" and
+// "Scramble" in different years both count as one 2-Man Scramble lineage).
+// Uses the round's actual game_formats.grouping_size rather than the cosmetic
+// event_category column (schema note: event_category is DISPLAY ONLY and
+// doesn't reliably reflect pair/team size -- e.g. Team Stableford rounds are
+// tagged event_category='Individual' despite being a team format).
+function normalizeEventBucket(eventName: string, groupingSize: number): string {
   const n = eventName.toLowerCase();
-  if (n.includes("scramble")) return "Scramble";
-  if (n.includes("cha cha") || n.includes("shamble")) return "Shamble";
-  return "Individual Stroke Play";
+  if (n.includes("scramble")) return groupingSize >= 4 ? "4-Man Scramble" : "2-Man Scramble";
+  if (n.includes("cha cha") || n.includes("shamble")) return "2-Man Shamble";
+  if (n.includes("stableford")) return "Team Stableford";
+  if (n.includes("head to head") || n.includes("match play")) return "Head to Head";
+  return eventName;
+}
+
+export interface FormatRecordCard {
+  bucket: string;
+  value: string;
+  year: number;
+  names: string[];
+}
+
+// Only formats that have been played more than once qualify as a Hall of
+// Fame category -- a single-occurrence event (e.g. a brand new format tried
+// once) doesn't have enough of a track record to call anything a "record."
+export async function getFormatRecords(): Promise<FormatRecordCard[]> {
+  const { data, error } = await supabase
+    .from("round_results")
+    .select(
+      "match_id, gross_strokes, event_score, matches(round_id, rounds(event_name, scoring_type, tournaments(year), game_formats(grouping_size)))"
+    )
+    .not("gross_strokes", "is", null);
+  if (error) throw error;
+
+  const rows: FormatRecordRawRow[] = (data ?? []).map((row: any) => ({
+    match_id: row.match_id,
+    round_id: row.matches?.round_id,
+    gross_strokes: row.gross_strokes,
+    event_score: row.event_score,
+    event_name: row.matches?.rounds?.event_name ?? "",
+    scoring_type: row.matches?.rounds?.scoring_type ?? "",
+    grouping_size: row.matches?.rounds?.game_formats?.grouping_size ?? 1,
+    year: row.matches?.rounds?.tournaments?.year,
+  }));
+
+  const byBucket = new Map<string, FormatRecordRawRow[]>();
+  for (const r of rows) {
+    if (!r.year) continue;
+    const bucket = normalizeEventBucket(r.event_name, r.grouping_size);
+    const list = byBucket.get(bucket) ?? [];
+    list.push(r);
+    byBucket.set(bucket, list);
+  }
+
+  const bestByBucket: { bucket: string; match_id: number; value: string; year: number }[] = [];
+  for (const [bucket, bucketRows] of byBucket) {
+    const distinctRounds = new Set(bucketRows.map((r) => r.round_id));
+    if (distinctRounds.size < 2) continue; // must have been played more than once
+
+    const isStableford = bucketRows[0].scoring_type === "Stableford";
+    const withMetric = bucketRows.filter((r) => (isStableford ? r.event_score !== null : r.gross_strokes !== null));
+    if (withMetric.length === 0) continue;
+
+    const best = isStableford
+      ? withMetric.reduce((a, b) => (b.event_score! > a.event_score! ? b : a))
+      : withMetric.reduce((a, b) => (b.gross_strokes! < a.gross_strokes! ? b : a));
+
+    bestByBucket.push({
+      bucket,
+      match_id: best.match_id,
+      year: best.year,
+      value: isStableford ? `${best.event_score} pts` : `${best.gross_strokes}`,
+    });
+  }
+
+  // Fetch every participant on each record-setting match so 2-Man/4-Man
+  // records list the whole pair/team, not just one row's player.
+  const matchIds = bestByBucket.map((r) => r.match_id);
+  const { data: participants, error: pErr } = matchIds.length
+    ? await supabase.from("match_participants").select("match_id, players(display_name)").in("match_id", matchIds)
+    : { data: [], error: null };
+  if (pErr) throw pErr;
+  const namesByMatch = new Map<number, string[]>();
+  for (const p of (participants ?? []) as any[]) {
+    const list = namesByMatch.get(p.match_id) ?? [];
+    list.push(p.players?.display_name ?? "Unknown");
+    namesByMatch.set(p.match_id, list);
+  }
+
+  return bestByBucket
+    .map((r) => ({ bucket: r.bucket, value: r.value, year: r.year, names: namesByMatch.get(r.match_id) ?? [] }))
+    .sort((a, b) => a.bucket.localeCompare(b.bucket));
 }
 
 export interface RecordCard {
@@ -585,50 +694,24 @@ export interface RecordCard {
   detail: string;
 }
 
-export async function getRecords(): Promise<RecordCard[]> {
+// Cross-format, all-time bests -- not tied to a specific recurring event, so
+// the "played more than once" rule doesn't apply the same way here.
+export async function getOverallRecords(): Promise<RecordCard[]> {
   const { data, error } = await supabase
     .from("round_results")
-    .select(
-      "gross_strokes, event_score, tournament_points, players(display_name), matches(rounds(event_name, scoring_type, tournaments(year)))"
-    );
+    .select("tournament_points, players(display_name), matches(rounds(event_name, tournaments(year)))")
+    .not("tournament_points", "is", null);
   if (error) throw error;
 
-  const rows: RecordsRow[] = (data ?? []).map((row: any) => ({
-    display_name: row.players?.display_name ?? "Unknown",
-    gross_strokes: row.gross_strokes,
-    event_score: row.event_score,
-    tournament_points: row.tournament_points,
-    event_name: row.matches?.rounds?.event_name ?? "",
-    scoring_type: row.matches?.rounds?.scoring_type ?? "",
-    year: row.matches?.rounds?.tournaments?.year,
-  }));
-
   const cards: RecordCard[] = [];
-  const lowest = (candidates: RecordsRow[]) => candidates.reduce((a, b) => (b.gross_strokes! < a.gross_strokes! ? b : a));
-
-  const strokePlayRows = rows.filter((r) => r.scoring_type !== "Stableford" && r.gross_strokes !== null);
-  if (strokePlayRows.length) {
-    const best = lowest(strokePlayRows);
-    cards.push({ label: "Lowest Gross Score (Overall)", value: `${best.gross_strokes}`, detail: `${best.display_name} · ${best.year} · ${best.event_name}` });
-  }
-
-  for (const bucket of ["Scramble", "Shamble", "Individual Stroke Play"]) {
-    const bucketRows = strokePlayRows.filter((r) => classifyFormat(r.event_name) === bucket);
-    if (!bucketRows.length) continue;
-    const best = lowest(bucketRows);
-    cards.push({ label: `Lowest Gross — ${bucket}`, value: `${best.gross_strokes}`, detail: `${best.display_name} · ${best.year} · ${best.event_name}` });
-  }
-
-  const stablefordRows = rows.filter((r) => r.scoring_type === "Stableford" && r.event_score !== null);
-  if (stablefordRows.length) {
-    const best = stablefordRows.reduce((a, b) => (b.event_score! > a.event_score! ? b : a));
-    cards.push({ label: "Best Stableford Round", value: `${best.event_score} pts`, detail: `${best.display_name} · ${best.year}` });
-  }
-
-  const pointsRows = rows.filter((r) => r.tournament_points !== null);
-  if (pointsRows.length) {
-    const best = pointsRows.reduce((a, b) => (b.tournament_points! > a.tournament_points! ? b : a));
-    cards.push({ label: "Most Points — Single Round", value: `${best.tournament_points} pts`, detail: `${best.display_name} · ${best.year} · ${best.event_name}` });
+  const rows = (data ?? []) as any[];
+  if (rows.length) {
+    const best = rows.reduce((a, b) => (b.tournament_points > a.tournament_points ? b : a));
+    cards.push({
+      label: "Most Points — Single Round",
+      value: `${best.tournament_points} pts`,
+      detail: `${best.players?.display_name ?? "Unknown"} · ${best.matches?.rounds?.tournaments?.year} · ${best.matches?.rounds?.event_name}`,
+    });
   }
 
   const career = await getPlayerCareerStats();
@@ -638,4 +721,242 @@ export async function getRecords(): Promise<RecordCard[]> {
   }
 
   return cards;
+}
+
+// ── Population Analytics (Players landing page) ──
+
+// Shared building block: every (match, player) with a computable Strokes
+// Gained value (adjusted_handicap + gross_strokes both present). Reused by
+// the population leaderboard, format-leader breakdown, and pairing analytics
+// below so each doesn't repeat the same two-query fetch-and-join.
+interface StrokesGainedRow {
+  match_id: number;
+  player_id: number;
+  display_name: string;
+  strokes_gained: number;
+  event_name: string;
+  grouping_size: number;
+}
+
+async function getAllStrokesGainedRows(): Promise<StrokesGainedRow[]> {
+  const { data: participants, error: pErr } = await supabase
+    .from("match_participants")
+    .select(
+      "match_id, player_id, adjusted_handicap, players(display_name), matches(rounds(course_par, event_name, game_formats(grouping_size)))"
+    )
+    .not("adjusted_handicap", "is", null);
+  if (pErr) throw pErr;
+
+  const matchIds = [...new Set((participants ?? []).map((p: any) => p.match_id))];
+  const { data: results, error: rErr } = matchIds.length
+    ? await supabase.from("round_results").select("match_id, player_id, gross_strokes").in("match_id", matchIds)
+    : { data: [], error: null };
+  if (rErr) throw rErr;
+  const grossByKey = new Map((results ?? []).map((r) => [`${r.match_id}_${r.player_id}`, r.gross_strokes]));
+
+  const rows: StrokesGainedRow[] = [];
+  for (const p of (participants ?? []) as any[]) {
+    const gross = grossByKey.get(`${p.match_id}_${p.player_id}`);
+    const round = p.matches?.rounds;
+    const coursePar = round?.course_par;
+    if (gross === null || gross === undefined || coursePar === null || coursePar === undefined) continue;
+    rows.push({
+      match_id: p.match_id,
+      player_id: p.player_id,
+      display_name: p.players?.display_name ?? "Unknown",
+      strokes_gained: coursePar + p.adjusted_handicap - gross,
+      event_name: round.event_name ?? "",
+      grouping_size: round.game_formats?.grouping_size ?? 1,
+    });
+  }
+  return rows;
+}
+
+export interface PlayerStrokesGainedSummary {
+  player_id: number;
+  display_name: string;
+  avg_strokes_gained: number;
+  rounds: number;
+}
+
+export async function getAllPlayersStrokesGained(): Promise<PlayerStrokesGainedSummary[]> {
+  const rows = await getAllStrokesGainedRows();
+  const byPlayer = new Map<number, { display_name: string; values: number[] }>();
+  for (const r of rows) {
+    const entry = byPlayer.get(r.player_id) ?? { display_name: r.display_name, values: [] };
+    entry.values.push(r.strokes_gained);
+    byPlayer.set(r.player_id, entry);
+  }
+  return [...byPlayer.entries()]
+    .map(([player_id, { display_name, values }]) => ({
+      player_id,
+      display_name,
+      avg_strokes_gained: values.reduce((a, b) => a + b, 0) / values.length,
+      rounds: values.length,
+    }))
+    .sort((a, b) => b.avg_strokes_gained - a.avg_strokes_gained);
+}
+
+export interface FormatLeader {
+  bucket: string;
+  player_id: number;
+  display_name: string;
+  avg_strokes_gained: number;
+}
+
+// "Who plays best in what events" -- the top Strokes Gained average per
+// recurring format bucket (same bucketing as the Hall of Fame records).
+export async function getFormatLeaders(): Promise<FormatLeader[]> {
+  const rows = await getAllStrokesGainedRows();
+  const byBucketPlayer = new Map<string, { player_id: number; display_name: string; values: number[] }>();
+  for (const r of rows) {
+    const bucket = normalizeEventBucket(r.event_name, r.grouping_size);
+    const key = `${bucket}__${r.player_id}`;
+    const entry = byBucketPlayer.get(key) ?? { player_id: r.player_id, display_name: r.display_name, values: [] };
+    entry.values.push(r.strokes_gained);
+    byBucketPlayer.set(key, entry);
+  }
+
+  const bestByBucket = new Map<string, FormatLeader>();
+  for (const [key, { player_id, display_name, values }] of byBucketPlayer) {
+    const bucket = key.split("__")[0];
+    const avg = values.reduce((a, b) => a + b, 0) / values.length;
+    const current = bestByBucket.get(bucket);
+    if (!current || avg > current.avg_strokes_gained) bestByBucket.set(bucket, { bucket, player_id, display_name, avg_strokes_gained: avg });
+  }
+  return [...bestByBucket.values()].sort((a, b) => a.bucket.localeCompare(b.bucket));
+}
+
+export interface PlayerRecordSummary {
+  player_id: number;
+  display_name: string;
+  wins: number;
+  top3: number;
+  rounds: number;
+}
+
+// "Overall record in events" -- round-level finishes (matchup_rank), not
+// tournament wins (that's the team standings' job).
+export async function getAllPlayersRecord(): Promise<PlayerRecordSummary[]> {
+  const { data, error } = await supabase
+    .from("round_results")
+    .select("player_id, matchup_rank, players(display_name)")
+    .not("matchup_rank", "is", null);
+  if (error) throw error;
+
+  const byPlayer = new Map<number, PlayerRecordSummary>();
+  for (const row of (data ?? []) as any[]) {
+    const entry = byPlayer.get(row.player_id) ?? {
+      player_id: row.player_id,
+      display_name: row.players?.display_name ?? "Unknown",
+      wins: 0,
+      top3: 0,
+      rounds: 0,
+    };
+    entry.rounds += 1;
+    if (row.matchup_rank === 1) entry.wins += 1;
+    if (row.matchup_rank <= 3) entry.top3 += 1;
+    byPlayer.set(row.player_id, entry);
+  }
+  return [...byPlayer.values()].sort((a, b) => b.wins - a.wins || b.top3 - a.top3);
+}
+
+// ── Pairing Analytics ──
+
+export interface PairingSummary {
+  player_a: string;
+  player_b: string;
+  matches_together: number;
+  avg_strokes_gained: number;
+}
+
+// Chemistry between teammates: every match with 2+ participants (individual-
+// format matches only ever have 1, so those naturally fall out here) yields
+// one shared Strokes Gained observation per unique pair of co-participants.
+// Requires 2+ shared matches so a single round doesn't look like a "record."
+export async function getTeammatePairings(): Promise<PairingSummary[]> {
+  const rows = await getAllStrokesGainedRows();
+  const byMatch = new Map<number, { player_id: number; display_name: string; strokes_gained: number }[]>();
+  for (const r of rows) {
+    const list = byMatch.get(r.match_id) ?? [];
+    list.push({ player_id: r.player_id, display_name: r.display_name, strokes_gained: r.strokes_gained });
+    byMatch.set(r.match_id, list);
+  }
+
+  const pairs = new Map<string, { a: string; b: string; values: number[] }>();
+  for (const members of byMatch.values()) {
+    if (members.length < 2) continue;
+    const matchAvg = members.reduce((sum, m) => sum + m.strokes_gained, 0) / members.length;
+    for (let i = 0; i < members.length; i++) {
+      for (let j = i + 1; j < members.length; j++) {
+        const [a, b] = [members[i], members[j]].sort((x, y) => x.player_id - y.player_id);
+        const key = `${a.player_id}_${b.player_id}`;
+        const entry = pairs.get(key) ?? { a: a.display_name, b: b.display_name, values: [] };
+        entry.values.push(matchAvg);
+        pairs.set(key, entry);
+      }
+    }
+  }
+
+  return [...pairs.values()]
+    .filter((p) => p.values.length >= 2)
+    .map((p) => ({
+      player_a: p.a,
+      player_b: p.b,
+      matches_together: p.values.length,
+      avg_strokes_gained: p.values.reduce((a, b) => a + b, 0) / p.values.length,
+    }))
+    .sort((a, b) => b.avg_strokes_gained - a.avg_strokes_gained);
+}
+
+export interface RivalrySummary {
+  player_a: string;
+  player_b: string;
+  meetings: number;
+  a_wins: number;
+  b_wins: number;
+}
+
+// Head-to-head record between any two players who've shared a ROUND
+// (regardless of team), decided by whoever had the better matchup_rank that
+// round. Generalizes "rivalry" across every format, not just literal Match
+// Play. Requires 3+ meetings so a passing round doesn't read as a rivalry.
+export async function getRivalries(): Promise<RivalrySummary[]> {
+  const { data, error } = await supabase
+    .from("round_results")
+    .select("player_id, matchup_rank, players(display_name), matches(round_id)")
+    .not("matchup_rank", "is", null);
+  if (error) throw error;
+
+  const byRound = new Map<number, { player_id: number; display_name: string; rank: number }[]>();
+  for (const row of (data ?? []) as any[]) {
+    const roundId = row.matches?.round_id;
+    if (roundId === undefined) continue;
+    const list = byRound.get(roundId) ?? [];
+    list.push({ player_id: row.player_id, display_name: row.players?.display_name ?? "Unknown", rank: row.matchup_rank });
+    byRound.set(roundId, list);
+  }
+
+  const pairs = new Map<string, { a: string; b: string; meetings: number; aWins: number; bWins: number }>();
+  for (const members of byRound.values()) {
+    for (let i = 0; i < members.length; i++) {
+      for (let j = i + 1; j < members.length; j++) {
+        const m1 = members[i];
+        const m2 = members[j];
+        if (m1.rank === m2.rank) continue;
+        const [a, b] = m1.player_id < m2.player_id ? [m1, m2] : [m2, m1];
+        const key = `${a.player_id}_${b.player_id}`;
+        const entry = pairs.get(key) ?? { a: a.display_name, b: b.display_name, meetings: 0, aWins: 0, bWins: 0 };
+        entry.meetings += 1;
+        if (a.rank < b.rank) entry.aWins += 1;
+        else entry.bWins += 1;
+        pairs.set(key, entry);
+      }
+    }
+  }
+
+  return [...pairs.values()]
+    .filter((p) => p.meetings >= 3)
+    .map((p) => ({ player_a: p.a, player_b: p.b, meetings: p.meetings, a_wins: p.aWins, b_wins: p.bWins }))
+    .sort((a, b) => Math.abs(b.a_wins - b.b_wins) - Math.abs(a.a_wins - a.b_wins));
 }

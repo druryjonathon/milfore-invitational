@@ -505,6 +505,121 @@ body {
   color: rgba(255, 255, 255, 0.5);
 }
 
+/* ── HOME HERO ── */
+.hero-banner {
+  background: linear-gradient(170deg, var(--red-d) 0%, var(--red) 60%, var(--red-l) 100%);
+  padding: 36px 24px 28px;
+  text-align: center;
+  position: relative;
+  overflow: hidden;
+}
+.hero-banner::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(circle at 50% -20%, rgba(232, 201, 110, 0.35), transparent 60%);
+  pointer-events: none;
+}
+.hero-crest {
+  font-size: 34px;
+  margin-bottom: 6px;
+}
+.hero-title {
+  font-family: var(--fd);
+  font-size: 34px;
+  font-weight: 900;
+  color: #fff;
+  line-height: 1.05;
+  position: relative;
+}
+.hero-title span {
+  color: var(--gold-l);
+}
+.hero-sub {
+  font-size: 12px;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  color: rgba(255, 255, 255, 0.55);
+  margin-top: 8px;
+  position: relative;
+}
+.hero-champion {
+  margin-top: 22px;
+  background: rgba(0, 0, 0, 0.18);
+  border: 1px solid rgba(232, 201, 110, 0.35);
+  border-radius: 16px;
+  padding: 14px 18px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  text-decoration: none;
+  position: relative;
+}
+.hero-champion-label {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  color: var(--gold-l);
+}
+.hero-champion-name {
+  font-family: var(--fd);
+  font-size: 20px;
+  font-weight: 900;
+  color: #fff;
+  margin-top: 2px;
+}
+.hero-champion-pts {
+  font-family: var(--fd);
+  font-size: 30px;
+  font-weight: 900;
+  color: var(--gold-l);
+  line-height: 1;
+}
+
+/* ── MODULE NAV CARDS ── */
+.module-card {
+  background: #fff;
+  border-radius: 16px;
+  margin: 0 16px 12px;
+  padding: 16px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.06);
+  text-decoration: none;
+  color: inherit;
+}
+.module-card:active {
+  transform: scale(0.98);
+}
+.module-icon {
+  width: 46px;
+  height: 46px;
+  border-radius: 12px;
+  background: linear-gradient(135deg, var(--red-d), var(--red));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  color: #fff;
+}
+.module-icon svg {
+  width: 22px;
+  height: 22px;
+}
+.module-title {
+  font-family: var(--fd);
+  font-size: 17px;
+  font-weight: 900;
+  color: var(--ink);
+}
+.module-sub {
+  font-size: 12px;
+  color: var(--ink3);
+  margin-top: 2px;
+}
+
 /* ── BACK BUTTON ── */
 .back {
   display: flex;

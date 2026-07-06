@@ -90,7 +90,7 @@ export function PlayerDetail() {
             <div>
               <div style={{ fontFamily: "var(--fd)", fontSize: 22, fontWeight: 900 }}>{data.player.display_name}</div>
               <div style={{ fontSize: 12, color: "var(--ink3)", marginTop: 3 }}>
-                {data.stats ? `${data.stats.years_played} years played` : "No recorded history"}
+                {data.stats ? `${data.stats.years_played} year${data.stats.years_played === 1 ? "" : "s"} played` : "No recorded history"}
               </div>
             </div>
           </div>
