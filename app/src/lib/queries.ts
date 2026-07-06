@@ -413,63 +413,81 @@ export async function getIndividualPointsForTournament(tournamentId: number): Pr
     .sort((a, b) => b.points - a.points);
 }
 
-export interface PlayerYearToPar {
+export interface StrokesGainedEntry {
+  match_id: number;
+  round_id: number;
   year: number;
-  avg_to_par: number;
-  rounds_played: number;
+  round_number: number;
+  event_name: string;
+  format_name: string;
+  scoring_style: string;
+  grouping_size: number;
+  course_par: number;
+  gross_strokes: number;
+  adjusted_handicap: number;
+  expected_score: number;
+  strokes_gained: number;
+  attribution: "individual" | "team";
 }
 
-// Stand-in for "strokes gained" (strokes_gained_gross/net are 0% populated in
-// the live data) — net-to-par tells a similar year-over-year trend story
-// using fields that are actually filled in (net_strokes is ~81% populated).
-export async function getPlayerNetToParByYear(playerId: number): Promise<PlayerYearToPar[]> {
-  const { data, error } = await supabase
-    .from("round_results")
-    .select("match_id, net_strokes, matches(rounds(course_par, tournaments(year)))")
+// Expected Score = course_par + adjusted_handicap (the player/pairing's own
+// format-specific handicap allowance, BEFORE netting against the field's
+// low handicap — that's what strokes_received is for elsewhere). Strokes
+// Gained = Expected Score - actual gross score. For weighted_by_rank formats
+// (2/4-Man Scramble) adjusted_handicap and gross_strokes are both shared
+// team-level values (per game_formats/match_participants schema notes), so
+// the result there is a team-attributed figure, not an individual one --
+// tagged via `attribution` so callers can filter/label accordingly.
+export async function getPlayerStrokesGained(playerId: number): Promise<StrokesGainedEntry[]> {
+  const { data: participants, error: pErr } = await supabase
+    .from("match_participants")
+    .select(
+      "match_id, adjusted_handicap, matches(round_id, rounds(round_number, course_par, event_name, tournaments(year), game_formats(format_name, scoring_style, grouping_size)))"
+    )
     .eq("player_id", playerId)
-    .not("net_strokes", "is", null);
-  if (error) throw error;
+    .not("adjusted_handicap", "is", null);
+  if (pErr) throw pErr;
 
-  const rows = (data ?? []) as any[];
-  const matchIds = [...new Set(rows.map((r) => r.match_id))];
+  const matchIds = (participants ?? []).map((p: any) => p.match_id);
+  if (matchIds.length === 0) return [];
 
-  // Some formats store one shared team net across all teammates on a match
-  // (see MatchDetail's "Team Net" handling) — exclude those here since the
-  // value isn't actually this player's own net score and would otherwise
-  // badly skew a per-player trend (confirmed: one such row inflated a
-  // player's yearly average by ~200 strokes-to-par).
-  const { data: allMatchResults, error: matchResultsErr } = matchIds.length
-    ? await supabase.from("round_results").select("match_id, net_strokes").in("match_id", matchIds)
-    : { data: [], error: null };
-  if (matchResultsErr) throw matchResultsErr;
+  const { data: results, error: rErr } = await supabase
+    .from("round_results")
+    .select("match_id, gross_strokes")
+    .eq("player_id", playerId)
+    .in("match_id", matchIds);
+  if (rErr) throw rErr;
+  const grossByMatch = new Map((results ?? []).map((r) => [r.match_id, r.gross_strokes]));
 
-  const netsByMatch = new Map<number, number[]>();
-  for (const r of allMatchResults ?? []) {
-    if (r.net_strokes === null) continue;
-    const list = netsByMatch.get(r.match_id) ?? [];
-    list.push(r.net_strokes);
-    netsByMatch.set(r.match_id, list);
+  const out: StrokesGainedEntry[] = [];
+  for (const p of (participants ?? []) as any[]) {
+    const gross = grossByMatch.get(p.match_id);
+    if (gross === null || gross === undefined) continue;
+    const round = p.matches?.rounds;
+    const year = round?.tournaments?.year;
+    const coursePar = round?.course_par;
+    const fmt = round?.game_formats;
+    if (!year || coursePar === null || coursePar === undefined || !fmt) continue;
+
+    const expectedScore = coursePar + p.adjusted_handicap;
+    out.push({
+      match_id: p.match_id,
+      round_id: p.matches.round_id,
+      year,
+      round_number: round.round_number,
+      event_name: round.event_name,
+      format_name: fmt.format_name,
+      scoring_style: fmt.scoring_style,
+      grouping_size: fmt.grouping_size,
+      course_par: coursePar,
+      gross_strokes: gross,
+      adjusted_handicap: p.adjusted_handicap,
+      expected_score: expectedScore,
+      strokes_gained: expectedScore - gross,
+      attribution: fmt.grouping_size > 1 ? "team" : "individual",
+    });
   }
-  const isSharedMatch = (matchId: number) => {
-    const nets = netsByMatch.get(matchId) ?? [];
-    return nets.length > 1 && nets.every((n) => n === nets[0]);
-  };
-
-  const byYear = new Map<number, { sum: number; count: number }>();
-  for (const row of rows) {
-    if (isSharedMatch(row.match_id)) continue;
-    const year = row.matches?.rounds?.tournaments?.year;
-    const coursePar = row.matches?.rounds?.course_par;
-    if (!year || coursePar === null || coursePar === undefined) continue;
-    const existing = byYear.get(year) ?? { sum: 0, count: 0 };
-    existing.sum += row.net_strokes - coursePar;
-    existing.count += 1;
-    byYear.set(year, existing);
-  }
-
-  return [...byYear.entries()]
-    .map(([year, { sum, count }]) => ({ year, avg_to_par: sum / count, rounds_played: count }))
-    .sort((a, b) => a.year - b.year);
+  return out.sort((a, b) => a.year - b.year || a.round_number - b.round_number);
 }
 
 export interface ScoreByParType {
