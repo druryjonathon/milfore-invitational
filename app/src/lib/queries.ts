@@ -255,12 +255,6 @@ export async function getPlayer(playerId: number): Promise<Player> {
   return data;
 }
 
-export async function getPlayerCareerStats(): Promise<PlayerCareerStats[]> {
-  const { data, error } = await supabase.from("v_player_career_stats").select("*");
-  if (error) throw error;
-  return data ?? [];
-}
-
 export async function getPlayerCareerStat(playerId: number): Promise<PlayerCareerStats | null> {
   const { data, error } = await supabase
     .from("v_player_career_stats")
@@ -269,32 +263,6 @@ export async function getPlayerCareerStat(playerId: number): Promise<PlayerCaree
     .maybeSingle();
   if (error) throw error;
   return data;
-}
-
-export interface PlayerYearSummary {
-  year: number;
-  tournament_id: number;
-  tournament_points: number;
-}
-
-export async function getPlayerHistory(playerId: number): Promise<PlayerYearSummary[]> {
-  const { data, error } = await supabase
-    .from("round_results")
-    .select("tournament_points, matches(rounds(tournament_id, tournaments(year)))")
-    .eq("player_id", playerId);
-  if (error) throw error;
-
-  const byYear = new Map<number, PlayerYearSummary>();
-  for (const row of (data ?? []) as any[]) {
-    const year = row.matches?.rounds?.tournaments?.year;
-    const tournamentId = row.matches?.rounds?.tournament_id;
-    if (!year) continue;
-    const existing = byYear.get(year);
-    const points = row.tournament_points ?? 0;
-    if (existing) existing.tournament_points += points;
-    else byYear.set(year, { year, tournament_id: tournamentId, tournament_points: points });
-  }
-  return [...byYear.values()].sort((a, b) => b.year - a.year);
 }
 
 // ── Analytics ──
@@ -380,6 +348,230 @@ export async function getTeamPointsByRound(tournamentId: number): Promise<TeamRo
     .sort((a, b) => a.round_number - b.round_number || a.team_id - b.team_id);
 }
 
+// ── Individually-adjusted points ──
+//
+// round_results.tournament_points carries the FULL shared team award on
+// every teammate's own row for team-scored formats (by schema design, same
+// caveat as v_team_standings) -- fine for standings, but wrong for crediting
+// an individual: a 4-man scramble team's 8 points isn't "8 points" for each
+// of the 4 players, it's 8 points for the team, so each gets 2. This section
+// detects sharing empirically per match (all participants' tournament_points
+// identical) rather than assuming by format, since some "grouped" formats
+// (Match Play) already store distinct per-player W/L points and must NOT be
+// redivided.
+//
+// One format needs more than an even split: the 2024 Cha Cha Cha ("2-Man
+// Shamble", handicap_method='individual_pct', grouping_size=2) is a best-ball
+// pairing where each partner has their own individual per-hole net score and
+// the better of the two counts for the team each hole -- so credit for that
+// round should follow how many holes each partner's own score actually won,
+// not a flat 50/50 split.
+
+interface AdjustedPointsRow {
+  match_id: number;
+  tournament_id: number;
+  year: number;
+  player_id: number;
+  display_name: string;
+  points: number;
+}
+
+function strokesOnHole(adjustedHandicap: number, strokeIndex: number): number {
+  const rounded = Math.round(adjustedHandicap);
+  const base = Math.floor(rounded / 18);
+  const extra = ((rounded % 18) + 18) % 18;
+  return base + (strokeIndex <= extra ? 1 : 0);
+}
+
+// Per-hole net-score comparison for 2-man Shamble pairs -- returns each
+// player's share (0-1) of that match's award, based on how many compared
+// holes their own net score was the better (team-counting) one.
+async function computeShambleContributionWeights(matchIds: number[]): Promise<Map<string, number>> {
+  const weights = new Map<string, number>();
+  if (matchIds.length === 0) return weights;
+
+  const { data: participants, error: pErr } = await supabase
+    .from("match_participants")
+    .select("match_id, player_id, adjusted_handicap")
+    .in("match_id", matchIds);
+  if (pErr) throw pErr;
+
+  const { data: matches, error: mErr } = await supabase.from("matches").select("match_id, round_id").in("match_id", matchIds);
+  if (mErr) throw mErr;
+  const roundIdByMatch = new Map((matches ?? []).map((m) => [m.match_id, m.round_id]));
+  const roundIds = [...new Set([...roundIdByMatch.values()])];
+
+  const { data: holes, error: hErr } = await supabase
+    .from("round_holes")
+    .select("round_id, hole_no, stroke_index")
+    .in("round_id", roundIds);
+  if (hErr) throw hErr;
+  const holesByRound = new Map<number, { hole_no: number; stroke_index: number }[]>();
+  for (const h of holes ?? []) {
+    const list = holesByRound.get(h.round_id) ?? [];
+    list.push(h);
+    holesByRound.set(h.round_id, list);
+  }
+
+  const { data: scores, error: sErr } = await supabase
+    .from("hole_scores")
+    .select("match_id, player_id, hole_no, gross_strokes")
+    .in("match_id", matchIds);
+  if (sErr) throw sErr;
+  const scoreMap = new Map<string, number | null>();
+  for (const s of scores ?? []) scoreMap.set(`${s.match_id}_${s.player_id}_${s.hole_no}`, s.gross_strokes);
+
+  const byMatch = new Map<number, { player_id: number; adjusted_handicap: number }[]>();
+  for (const p of (participants ?? []) as any[]) {
+    const list = byMatch.get(p.match_id) ?? [];
+    list.push({ player_id: p.player_id, adjusted_handicap: p.adjusted_handicap });
+    byMatch.set(p.match_id, list);
+  }
+
+  for (const [matchId, members] of byMatch) {
+    if (members.length !== 2) continue;
+    const roundId = roundIdByMatch.get(matchId);
+    const roundHoles = roundId !== undefined ? holesByRound.get(roundId) ?? [] : [];
+    const [a, b] = members;
+    let creditA = 0;
+    let creditB = 0;
+    let compared = 0;
+    for (const h of roundHoles) {
+      const grossA = scoreMap.get(`${matchId}_${a.player_id}_${h.hole_no}`);
+      const grossB = scoreMap.get(`${matchId}_${b.player_id}_${h.hole_no}`);
+      if (grossA === null || grossA === undefined || grossB === null || grossB === undefined) continue;
+      const netA = grossA - strokesOnHole(a.adjusted_handicap, h.stroke_index);
+      const netB = grossB - strokesOnHole(b.adjusted_handicap, h.stroke_index);
+      compared += 1;
+      if (netA < netB) creditA += 1;
+      else if (netB < netA) creditB += 1;
+      else {
+        creditA += 0.5;
+        creditB += 0.5;
+      }
+    }
+    if (compared === 0) {
+      weights.set(`${matchId}_${a.player_id}`, 0.5);
+      weights.set(`${matchId}_${b.player_id}`, 0.5);
+    } else {
+      weights.set(`${matchId}_${a.player_id}`, creditA / compared);
+      weights.set(`${matchId}_${b.player_id}`, creditB / compared);
+    }
+  }
+  return weights;
+}
+
+async function computeIndividuallyAdjustedPoints(): Promise<AdjustedPointsRow[]> {
+  const { data, error } = await supabase
+    .from("round_results")
+    .select(
+      "match_id, player_id, tournament_points, players(display_name), matches(round_id, rounds(tournament_id, tournaments(year), game_formats(format_name)))"
+    );
+  if (error) throw error;
+
+  const rows = (data ?? []).map((row: any) => ({
+    match_id: row.match_id,
+    player_id: row.player_id,
+    display_name: row.players?.display_name ?? "Unknown",
+    tournament_points: row.tournament_points ?? 0,
+    tournament_id: row.matches?.rounds?.tournament_id,
+    year: row.matches?.rounds?.tournaments?.year,
+    format_name: row.matches?.rounds?.game_formats?.format_name ?? "",
+  }));
+
+  const byMatch = new Map<number, typeof rows>();
+  for (const r of rows) {
+    const list = byMatch.get(r.match_id) ?? [];
+    list.push(r);
+    byMatch.set(r.match_id, list);
+  }
+
+  const shambleMatchIds: number[] = [];
+  for (const [matchId, participants] of byMatch) {
+    if (
+      participants.length > 1 &&
+      participants[0].format_name.toLowerCase().includes("shamble") &&
+      participants.every((p) => p.tournament_points === participants[0].tournament_points)
+    ) {
+      shambleMatchIds.push(matchId);
+    }
+  }
+  const shambleWeights = await computeShambleContributionWeights(shambleMatchIds);
+
+  const out: AdjustedPointsRow[] = [];
+  for (const [matchId, participants] of byMatch) {
+    if (!participants[0].year || !participants[0].tournament_id) continue;
+    const allShared = participants.length > 1 && participants.every((p) => p.tournament_points === participants[0].tournament_points);
+
+    if (!allShared) {
+      // Either a single-participant (already individual) or already
+      // per-player-distinct (e.g. Match Play win/loss) -- use as-is.
+      for (const p of participants) {
+        out.push({ match_id: matchId, tournament_id: p.tournament_id, year: p.year, player_id: p.player_id, display_name: p.display_name, points: p.tournament_points });
+      }
+      continue;
+    }
+
+    const shared = participants[0].tournament_points;
+    const isShamble = shambleMatchIds.includes(matchId);
+    for (const p of participants) {
+      const weight = isShamble ? shambleWeights.get(`${matchId}_${p.player_id}`) ?? 1 / participants.length : 1 / participants.length;
+      out.push({ match_id: matchId, tournament_id: p.tournament_id, year: p.year, player_id: p.player_id, display_name: p.display_name, points: shared * weight });
+    }
+  }
+  return out;
+}
+
+export interface PlayerAdjustedPoints {
+  player_id: number;
+  display_name: string;
+  points_by_year: { year: number; points: number }[];
+  career_points: number;
+}
+
+// Rescales each year's individually-adjusted points by (that year's total
+// points pool / the average pool size across years), so a year with a
+// bigger overall point pool (more rounds, more bonus categories, etc.)
+// doesn't automatically dominate the cross-year comparison. Splitting a
+// shared award preserves the pool total, so this is a fair normalization.
+export async function getAdjustedPlayerPoints(): Promise<PlayerAdjustedPoints[]> {
+  const rows = await computeIndividuallyAdjustedPoints();
+
+  const poolByYear = new Map<number, number>();
+  const byPlayerYear = new Map<string, number>();
+  const namesByPlayer = new Map<number, string>();
+  for (const r of rows) {
+    poolByYear.set(r.year, (poolByYear.get(r.year) ?? 0) + r.points);
+    const key = `${r.player_id}_${r.year}`;
+    byPlayerYear.set(key, (byPlayerYear.get(key) ?? 0) + r.points);
+    namesByPlayer.set(r.player_id, r.display_name);
+  }
+
+  const years = [...poolByYear.keys()];
+  const avgPool = years.length > 0 ? years.reduce((sum, y) => sum + (poolByYear.get(y) ?? 0), 0) / years.length : 0;
+
+  const byPlayer = new Map<number, { year: number; points: number }[]>();
+  for (const [key, rawPoints] of byPlayerYear) {
+    const [playerIdStr, yearStr] = key.split("_");
+    const playerId = Number(playerIdStr);
+    const year = Number(yearStr);
+    const pool = poolByYear.get(year) ?? 0;
+    const normalized = pool > 0 ? (rawPoints / pool) * avgPool : 0;
+    const list = byPlayer.get(playerId) ?? [];
+    list.push({ year, points: Math.round(normalized * 100) / 100 });
+    byPlayer.set(playerId, list);
+  }
+
+  return [...byPlayer.entries()]
+    .map(([player_id, points_by_year]) => ({
+      player_id,
+      display_name: namesByPlayer.get(player_id) ?? "Unknown",
+      points_by_year: points_by_year.sort((a, b) => b.year - a.year),
+      career_points: Math.round(points_by_year.reduce((sum, y) => sum + y.points, 0) * 100) / 100,
+    }))
+    .sort((a, b) => b.career_points - a.career_points);
+}
+
 export interface PlayerTournamentPoints {
   player_id: number;
   display_name: string;
@@ -388,46 +580,33 @@ export interface PlayerTournamentPoints {
   points: number;
 }
 
+// Individually-adjusted points for one tournament (rule 1 only -- already
+// scoped to a single year, so the cross-year pool normalization doesn't
+// apply here).
 export async function getIndividualPointsForTournament(tournamentId: number): Promise<PlayerTournamentPoints[]> {
-  const { data: rounds, error: roundsErr } = await supabase.from("rounds").select("round_id").eq("tournament_id", tournamentId);
-  if (roundsErr) throw roundsErr;
-  const roundIds = (rounds ?? []).map((r) => r.round_id);
-  if (roundIds.length === 0) return [];
+  const rows = await computeIndividuallyAdjustedPoints();
+  const scoped = rows.filter((r) => r.tournament_id === tournamentId);
+  if (scoped.length === 0) return [];
 
-  const { data: matches, error: matchesErr } = await supabase.from("matches").select("match_id").in("round_id", roundIds);
-  if (matchesErr) throw matchesErr;
-  const matchIds = (matches ?? []).map((m) => m.match_id);
-  if (matchIds.length === 0) return [];
-
-  const { data: results, error: resultsErr } = await supabase
-    .from("round_results")
-    .select("player_id, tournament_points")
-    .in("match_id", matchIds);
-  if (resultsErr) throw resultsErr;
-
-  const totals = new Map<number, number>();
-  for (const r of results ?? []) totals.set(r.player_id, (totals.get(r.player_id) ?? 0) + (r.tournament_points ?? 0));
+  const totals = new Map<number, { display_name: string; points: number }>();
+  for (const r of scoped) {
+    const entry = totals.get(r.player_id) ?? { display_name: r.display_name, points: 0 };
+    entry.points += r.points;
+    totals.set(r.player_id, entry);
+  }
 
   const roster = await getTeamRoster(tournamentId);
   const rosterByPlayer = new Map(roster.map((r) => [r.player_id, r]));
 
-  const playerIds = [...totals.keys()];
-  const { data: players, error: playersErr } = await supabase
-    .from("players")
-    .select("player_id, display_name")
-    .in("player_id", playerIds);
-  if (playersErr) throw playersErr;
-  const nameByPlayer = new Map((players ?? []).map((p) => [p.player_id, p.display_name]));
-
-  return playerIds
-    .map((playerId) => {
+  return [...totals.entries()]
+    .map(([playerId, { display_name, points }]) => {
       const rosterEntry = rosterByPlayer.get(playerId);
       return {
         player_id: playerId,
-        display_name: nameByPlayer.get(playerId) ?? "Unknown",
+        display_name,
         team_id: rosterEntry?.team_id ?? null,
         team_name: rosterEntry?.team_name ?? null,
-        points: totals.get(playerId) ?? 0,
+        points: Math.round(points * 100) / 100,
       };
     })
     .sort((a, b) => b.points - a.points);
@@ -695,28 +874,40 @@ export interface RecordCard {
 }
 
 // Cross-format, all-time bests -- not tied to a specific recurring event, so
-// the "played more than once" rule doesn't apply the same way here.
+// the "played more than once" rule doesn't apply the same way here. Points
+// here are individually-adjusted (a shared team award is split, not
+// double-counted); "Most Career Points" is also year-normalized since it
+// spans multiple tournaments.
 export async function getOverallRecords(): Promise<RecordCard[]> {
   const { data, error } = await supabase
     .from("round_results")
-    .select("tournament_points, players(display_name), matches(rounds(event_name, tournaments(year)))")
-    .not("tournament_points", "is", null);
+    .select("match_id, players(display_name), matches(rounds(event_name, tournaments(year)))");
   if (error) throw error;
 
-  const cards: RecordCard[] = [];
-  const rows = (data ?? []) as any[];
-  if (rows.length) {
-    const best = rows.reduce((a, b) => (b.tournament_points > a.tournament_points ? b : a));
-    cards.push({
-      label: "Most Points — Single Round",
-      value: `${best.tournament_points} pts`,
-      detail: `${best.players?.display_name ?? "Unknown"} · ${best.matches?.rounds?.tournaments?.year} · ${best.matches?.rounds?.event_name}`,
+  const detailByMatch = new Map<number, { display_name: string; year: number; event_name: string }>();
+  for (const row of (data ?? []) as any[]) {
+    detailByMatch.set(row.match_id, {
+      display_name: row.players?.display_name ?? "Unknown",
+      year: row.matches?.rounds?.tournaments?.year,
+      event_name: row.matches?.rounds?.event_name ?? "",
     });
   }
 
-  const career = await getPlayerCareerStats();
+  const cards: RecordCard[] = [];
+  const adjustedRows = await computeIndividuallyAdjustedPoints();
+  if (adjustedRows.length) {
+    const best = adjustedRows.reduce((a, b) => (b.points > a.points ? b : a));
+    const detail = detailByMatch.get(best.match_id);
+    cards.push({
+      label: "Most Points — Single Round",
+      value: `${Math.round(best.points * 100) / 100} pts`,
+      detail: `${best.display_name} · ${best.year} · ${detail?.event_name ?? ""}`,
+    });
+  }
+
+  const career = await getAdjustedPlayerPoints();
   if (career.length) {
-    const best = career.reduce((a, b) => ((b.career_points ?? 0) > (a.career_points ?? 0) ? b : a));
+    const best = career[0];
     cards.push({ label: "Most Career Points", value: `${best.career_points}`, detail: best.display_name });
   }
 
@@ -724,6 +915,17 @@ export async function getOverallRecords(): Promise<RecordCard[]> {
 }
 
 // ── Population Analytics (Players landing page) ──
+
+export interface PopulationFilter {
+  year?: number;
+  bucket?: string;
+}
+
+function matchesFilter(year: number, bucket: string, filter: PopulationFilter): boolean {
+  if (filter.year !== undefined && year !== filter.year) return false;
+  if (filter.bucket !== undefined && filter.bucket !== "all" && bucket !== filter.bucket) return false;
+  return true;
+}
 
 // Shared building block: every (match, player) with a computable Strokes
 // Gained value (adjusted_handicap + gross_strokes both present). Reused by
@@ -736,13 +938,15 @@ interface StrokesGainedRow {
   strokes_gained: number;
   event_name: string;
   grouping_size: number;
+  year: number;
+  bucket: string;
 }
 
-async function getAllStrokesGainedRows(): Promise<StrokesGainedRow[]> {
+async function getAllStrokesGainedRows(filter: PopulationFilter = {}): Promise<StrokesGainedRow[]> {
   const { data: participants, error: pErr } = await supabase
     .from("match_participants")
     .select(
-      "match_id, player_id, adjusted_handicap, players(display_name), matches(rounds(course_par, event_name, game_formats(grouping_size)))"
+      "match_id, player_id, adjusted_handicap, players(display_name), matches(rounds(course_par, event_name, tournaments(year), game_formats(grouping_size)))"
     )
     .not("adjusted_handicap", "is", null);
   if (pErr) throw pErr;
@@ -759,17 +963,37 @@ async function getAllStrokesGainedRows(): Promise<StrokesGainedRow[]> {
     const gross = grossByKey.get(`${p.match_id}_${p.player_id}`);
     const round = p.matches?.rounds;
     const coursePar = round?.course_par;
-    if (gross === null || gross === undefined || coursePar === null || coursePar === undefined) continue;
+    const year = round?.tournaments?.year;
+    if (gross === null || gross === undefined || coursePar === null || coursePar === undefined || !year) continue;
+    const groupingSize = round.game_formats?.grouping_size ?? 1;
+    const eventName = round.event_name ?? "";
+    const bucket = normalizeEventBucket(eventName, groupingSize);
+    if (!matchesFilter(year, bucket, filter)) continue;
     rows.push({
       match_id: p.match_id,
       player_id: p.player_id,
       display_name: p.players?.display_name ?? "Unknown",
       strokes_gained: coursePar + p.adjusted_handicap - gross,
-      event_name: round.event_name ?? "",
-      grouping_size: round.game_formats?.grouping_size ?? 1,
+      event_name: eventName,
+      grouping_size: groupingSize,
+      year,
+      bucket,
     });
   }
   return rows;
+}
+
+export interface PopulationFilterOptions {
+  years: number[];
+  buckets: string[];
+}
+
+export async function getPopulationFilterOptions(): Promise<PopulationFilterOptions> {
+  const rows = await getAllStrokesGainedRows();
+  return {
+    years: [...new Set(rows.map((r) => r.year))].sort((a, b) => a - b),
+    buckets: [...new Set(rows.map((r) => r.bucket))].sort(),
+  };
 }
 
 export interface PlayerStrokesGainedSummary {
@@ -779,8 +1003,8 @@ export interface PlayerStrokesGainedSummary {
   rounds: number;
 }
 
-export async function getAllPlayersStrokesGained(): Promise<PlayerStrokesGainedSummary[]> {
-  const rows = await getAllStrokesGainedRows();
+export async function getAllPlayersStrokesGained(filter: PopulationFilter = {}): Promise<PlayerStrokesGainedSummary[]> {
+  const rows = await getAllStrokesGainedRows(filter);
   const byPlayer = new Map<number, { display_name: string; values: number[] }>();
   for (const r of rows) {
     const entry = byPlayer.get(r.player_id) ?? { display_name: r.display_name, values: [] };
@@ -806,12 +1030,13 @@ export interface FormatLeader {
 
 // "Who plays best in what events" -- the top Strokes Gained average per
 // recurring format bucket (same bucketing as the Hall of Fame records).
-export async function getFormatLeaders(): Promise<FormatLeader[]> {
-  const rows = await getAllStrokesGainedRows();
+// Only the year filter applies here (a format filter doesn't make sense
+// against a view that's already broken out by format).
+export async function getFormatLeaders(filter: Pick<PopulationFilter, "year"> = {}): Promise<FormatLeader[]> {
+  const rows = await getAllStrokesGainedRows(filter);
   const byBucketPlayer = new Map<string, { player_id: number; display_name: string; values: number[] }>();
   for (const r of rows) {
-    const bucket = normalizeEventBucket(r.event_name, r.grouping_size);
-    const key = `${bucket}__${r.player_id}`;
+    const key = `${r.bucket}__${r.player_id}`;
     const entry = byBucketPlayer.get(key) ?? { player_id: r.player_id, display_name: r.display_name, values: [] };
     entry.values.push(r.strokes_gained);
     byBucketPlayer.set(key, entry);
@@ -837,15 +1062,22 @@ export interface PlayerRecordSummary {
 
 // "Overall record in events" -- round-level finishes (matchup_rank), not
 // tournament wins (that's the team standings' job).
-export async function getAllPlayersRecord(): Promise<PlayerRecordSummary[]> {
+export async function getAllPlayersRecord(filter: PopulationFilter = {}): Promise<PlayerRecordSummary[]> {
   const { data, error } = await supabase
     .from("round_results")
-    .select("player_id, matchup_rank, players(display_name)")
+    .select(
+      "player_id, matchup_rank, players(display_name), matches(rounds(event_name, tournaments(year), game_formats(grouping_size)))"
+    )
     .not("matchup_rank", "is", null);
   if (error) throw error;
 
   const byPlayer = new Map<number, PlayerRecordSummary>();
   for (const row of (data ?? []) as any[]) {
+    const round = row.matches?.rounds;
+    const year = round?.tournaments?.year;
+    const bucket = normalizeEventBucket(round?.event_name ?? "", round?.game_formats?.grouping_size ?? 1);
+    if (!year || !matchesFilter(year, bucket, filter)) continue;
+
     const entry = byPlayer.get(row.player_id) ?? {
       player_id: row.player_id,
       display_name: row.players?.display_name ?? "Unknown",
@@ -874,8 +1106,8 @@ export interface PairingSummary {
 // format matches only ever have 1, so those naturally fall out here) yields
 // one shared Strokes Gained observation per unique pair of co-participants.
 // Requires 2+ shared matches so a single round doesn't look like a "record."
-export async function getTeammatePairings(): Promise<PairingSummary[]> {
-  const rows = await getAllStrokesGainedRows();
+export async function getTeammatePairings(filter: PopulationFilter = {}): Promise<PairingSummary[]> {
+  const rows = await getAllStrokesGainedRows(filter);
   const byMatch = new Map<number, { player_id: number; display_name: string; strokes_gained: number }[]>();
   for (const r of rows) {
     const list = byMatch.get(r.match_id) ?? [];
@@ -920,18 +1152,24 @@ export interface RivalrySummary {
 // Head-to-head record between any two players who've shared a ROUND
 // (regardless of team), decided by whoever had the better matchup_rank that
 // round. Generalizes "rivalry" across every format, not just literal Match
-// Play. Requires 3+ meetings so a passing round doesn't read as a rivalry.
-export async function getRivalries(): Promise<RivalrySummary[]> {
+// Play. Requires 3+ meetings (or 1+ when a filter narrows the field to where
+// 3 meetings isn't realistic) so a passing round doesn't read as a rivalry.
+export async function getRivalries(filter: PopulationFilter = {}): Promise<RivalrySummary[]> {
   const { data, error } = await supabase
     .from("round_results")
-    .select("player_id, matchup_rank, players(display_name), matches(round_id)")
+    .select(
+      "player_id, matchup_rank, players(display_name), matches(round_id, rounds(event_name, tournaments(year), game_formats(grouping_size)))"
+    )
     .not("matchup_rank", "is", null);
   if (error) throw error;
 
   const byRound = new Map<number, { player_id: number; display_name: string; rank: number }[]>();
   for (const row of (data ?? []) as any[]) {
     const roundId = row.matches?.round_id;
-    if (roundId === undefined) continue;
+    const round = row.matches?.rounds;
+    const year = round?.tournaments?.year;
+    const bucket = normalizeEventBucket(round?.event_name ?? "", round?.game_formats?.grouping_size ?? 1);
+    if (roundId === undefined || !year || !matchesFilter(year, bucket, filter)) continue;
     const list = byRound.get(roundId) ?? [];
     list.push({ player_id: row.player_id, display_name: row.players?.display_name ?? "Unknown", rank: row.matchup_rank });
     byRound.set(roundId, list);
@@ -955,8 +1193,9 @@ export async function getRivalries(): Promise<RivalrySummary[]> {
     }
   }
 
+  const minMeetings = filter.year !== undefined || filter.bucket !== undefined ? 1 : 3;
   return [...pairs.values()]
-    .filter((p) => p.meetings >= 3)
+    .filter((p) => p.meetings >= minMeetings)
     .map((p) => ({ player_a: p.a, player_b: p.b, meetings: p.meetings, a_wins: p.aWins, b_wins: p.bWins }))
     .sort((a, b) => Math.abs(b.a_wins - b.b_wins) - Math.abs(a.a_wins - a.b_wins));
 }

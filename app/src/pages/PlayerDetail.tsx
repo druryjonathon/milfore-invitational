@@ -8,7 +8,7 @@ import { useQuery } from "../lib/useQuery";
 import {
   getPlayer,
   getPlayerCareerStat,
-  getPlayerHistory,
+  getAdjustedPlayerPoints,
   getPlayerStrokesGained,
   getPlayerScoreByParType,
   getPlayerFinishDistribution,
@@ -21,15 +21,16 @@ const GAINED_COLOR = "#1a7a3a";
 const LOST_COLOR = "var(--red)";
 
 async function loadPlayerDetail(playerId: number) {
-  const [player, stats, history, strokesGained, scoreByParType, finishDistribution] = await Promise.all([
+  const [player, stats, allAdjustedPoints, strokesGained, scoreByParType, finishDistribution] = await Promise.all([
     getPlayer(playerId),
     getPlayerCareerStat(playerId),
-    getPlayerHistory(playerId),
+    getAdjustedPlayerPoints(),
     getPlayerStrokesGained(playerId),
     getPlayerScoreByParType(playerId),
     getPlayerFinishDistribution(playerId),
   ]);
-  return { player, stats, history, strokesGained, scoreByParType, finishDistribution };
+  const adjustedPoints = allAdjustedPoints.find((p) => p.player_id === playerId) ?? null;
+  return { player, stats, adjustedPoints, strokesGained, scoreByParType, finishDistribution };
 }
 
 function avg(nums: number[]): number | null {
@@ -97,8 +98,8 @@ export function PlayerDetail() {
 
           <div className="stat-grid">
             <div className="stat-box">
-              <div className="stat-v">{data.stats?.career_points ?? "—"}</div>
-              <div className="stat-l">Career Points</div>
+              <div className="stat-v">{data.adjustedPoints?.career_points ?? "—"}</div>
+              <div className="stat-l">Career Points (Adj.)</div>
             </div>
             <div className="stat-box">
               <div className="stat-v" style={{ color: careerAvgStrokesGained !== null && careerAvgStrokesGained < 0 ? LOST_COLOR : GAINED_COLOR }}>
@@ -201,13 +202,16 @@ export function PlayerDetail() {
           )}
 
           <div style={{ padding: "4px 20px 8px", fontSize: 11, fontWeight: 700, letterSpacing: 1, textTransform: "uppercase", color: "var(--ink3)" }}>
-            Year by Year — Points
+            Year by Year — Points (Adjusted)
           </div>
-          {data.history.length === 0 ? (
+          <div style={{ fontSize: 11, color: "var(--ink3)", padding: "0 20px 8px" }}>
+            Individually split from shared team awards, and normalized so a bigger points year doesn't skew the total
+          </div>
+          {!data.adjustedPoints || data.adjustedPoints.points_by_year.length === 0 ? (
             <EmptyState label="No tournament history recorded yet." />
           ) : (
             <div className="card">
-              {data.history.map((yr) => (
+              {data.adjustedPoints.points_by_year.map((yr) => (
                 <Link
                   key={yr.year}
                   to={`/tournaments/${yr.year}`}
@@ -223,7 +227,7 @@ export function PlayerDetail() {
                 >
                   <div style={{ fontFamily: "var(--fd)", fontSize: 20, fontWeight: 900, color: "var(--red)", width: 52 }}>{yr.year}</div>
                   <div style={{ flex: 1, fontSize: 13, color: "var(--ink3)" }}>Tournament results</div>
-                  <div style={{ fontFamily: "var(--fd)", fontSize: 18, fontWeight: 900, color: "var(--red)" }}>{yr.tournament_points}pt</div>
+                  <div style={{ fontFamily: "var(--fd)", fontSize: 18, fontWeight: 900, color: "var(--red)" }}>{yr.points}pt</div>
                 </Link>
               ))}
             </div>

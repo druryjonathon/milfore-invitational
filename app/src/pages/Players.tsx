@@ -1,11 +1,14 @@
+import { useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { ResponsiveContainer, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Cell, ReferenceLine } from "recharts";
 import { SectionHeader } from "../components/SectionHeader";
+import { Tabs } from "../components/Tabs";
 import { LoadingState, ErrorState, EmptyState } from "../components/StatusStates";
 import { useQuery } from "../lib/useQuery";
 import {
   getPlayers,
-  getPlayerCareerStats,
+  getAdjustedPlayerPoints,
+  getPopulationFilterOptions,
   getAllPlayersStrokesGained,
   getAllPlayersRecord,
   getFormatLeaders,
@@ -18,28 +21,66 @@ import { vsPar } from "../lib/format";
 const GAINED_COLOR = "#1a7a3a";
 const LOST_COLOR = "var(--red)";
 
-async function loadPlayers() {
-  const [players, stats, strokesGained, record, formatLeaders, pairings, rivalries] = await Promise.all([
+// One-time substitute for Matreal, not a regular participant — excluded from
+// the Players page's population views (his match results and profile page
+// are still intact everywhere else, e.g. team rosters and round scorecards).
+const EXCLUDED_NAME = "Voet";
+
+async function loadFilterOptions() {
+  return getPopulationFilterOptions();
+}
+
+async function loadPlayers(yearFilter: string, bucketFilter: string) {
+  const filter = {
+    year: yearFilter === "all" ? undefined : Number(yearFilter),
+    bucket: bucketFilter === "all" ? undefined : bucketFilter,
+  };
+  const [players, adjustedPoints, strokesGained, record, formatLeaders, pairings, rivalries] = await Promise.all([
     getPlayers(),
-    getPlayerCareerStats(),
-    getAllPlayersStrokesGained(),
-    getAllPlayersRecord(),
-    getFormatLeaders(),
-    getTeammatePairings(),
-    getRivalries(),
+    getAdjustedPlayerPoints(),
+    getAllPlayersStrokesGained(filter),
+    getAllPlayersRecord(filter),
+    getFormatLeaders({ year: filter.year }),
+    getTeammatePairings(filter),
+    getRivalries(filter),
   ]);
-  const statsByPlayer = new Map(stats.map((s) => [s.player_id, s]));
-  const roster = players.map((p) => ({ player: p, stats: statsByPlayer.get(p.player_id) ?? null }));
-  return { roster, strokesGained, record, formatLeaders, pairings, rivalries };
+  const pointsByPlayer = new Map(adjustedPoints.map((p) => [p.player_id, p]));
+  const roster = players
+    .filter((p) => p.display_name !== EXCLUDED_NAME)
+    .map((p) => ({ player: p, points: pointsByPlayer.get(p.player_id) ?? null }));
+
+  return {
+    roster,
+    strokesGained: strokesGained.filter((p) => p.display_name !== EXCLUDED_NAME),
+    record: record.filter((p) => p.display_name !== EXCLUDED_NAME),
+    formatLeaders: formatLeaders.filter((f) => f.display_name !== EXCLUDED_NAME),
+    pairings: pairings.filter((p) => p.player_a !== EXCLUDED_NAME && p.player_b !== EXCLUDED_NAME),
+    rivalries: rivalries.filter((r) => r.player_a !== EXCLUDED_NAME && r.player_b !== EXCLUDED_NAME),
+  };
 }
 
 export function Players() {
-  const { data, loading, error } = useQuery(loadPlayers, []);
   const navigate = useNavigate();
+  const [yearFilter, setYearFilter] = useState("all");
+  const [bucketFilter, setBucketFilter] = useState("all");
+  const { data: options } = useQuery(loadFilterOptions, []);
+  const { data, loading, error } = useQuery(() => loadPlayers(yearFilter, bucketFilter), [yearFilter, bucketFilter]);
 
   return (
     <div>
       <SectionHeader title="Players" />
+
+      <Tabs
+        active={yearFilter}
+        onChange={setYearFilter}
+        options={[{ id: "all", label: "All Years" }, ...(options?.years ?? []).map((y) => ({ id: String(y), label: String(y) }))]}
+      />
+      <Tabs
+        active={bucketFilter}
+        onChange={setBucketFilter}
+        options={[{ id: "all", label: "All Formats" }, ...(options?.buckets ?? []).map((b) => ({ id: b, label: b }))]}
+      />
+
       {loading && <LoadingState />}
       {error !== null && <ErrorState error={error} />}
       {data && data.roster.length === 0 && <EmptyState label="No players recorded yet." />}
@@ -83,7 +124,7 @@ export function Players() {
         <div className="card">
           <div className="card-inner">
             <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 2 }}>Overall Record</div>
-            <div style={{ fontSize: 11, color: "var(--ink3)", marginBottom: 8 }}>Round finishes across every tournament</div>
+            <div style={{ fontSize: 11, color: "var(--ink3)", marginBottom: 8 }}>Round finishes for this filter</div>
             {data.record.slice(0, 8).map((r) => (
               <div
                 key={r.player_id}
@@ -170,7 +211,7 @@ export function Players() {
         <div className="card">
           <div className="card-inner">
             <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 2 }}>Rivalries</div>
-            <div style={{ fontSize: 11, color: "var(--ink3)", marginBottom: 8 }}>Head-to-head record on rounds played together (3+ meetings)</div>
+            <div style={{ fontSize: 11, color: "var(--ink3)", marginBottom: 8 }}>Head-to-head record on rounds played together</div>
             {data.rivalries.slice(0, 6).map((r, i) => (
               <div key={`${r.player_a}-${r.player_b}`} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 0", borderTop: i === 0 ? "none" : "1px solid var(--bdr)" }}>
                 <div style={{ flex: 1, fontSize: 13, fontWeight: 600 }}>
@@ -189,18 +230,18 @@ export function Players() {
       <div style={{ padding: "12px 20px 8px", fontSize: 11, fontWeight: 700, letterSpacing: 1, textTransform: "uppercase", color: "var(--ink3)" }}>
         All Players
       </div>
-      {data?.roster.map(({ player, stats }) => (
+      {data?.roster.map(({ player, points }) => (
         <Link key={player.player_id} to={`/players/${player.player_id}`} className="player-card">
           <div className="av av-sm">{player.display_name[0]}</div>
           <div style={{ flex: 1 }}>
             <div style={{ fontSize: 15, fontWeight: 700 }}>{player.display_name}</div>
             <div style={{ fontSize: 11, color: "var(--ink3)", marginTop: 2 }}>
-              {stats ? `${stats.years_played} year${stats.years_played === 1 ? "" : "s"} played` : "No history yet"}
+              {points ? `${points.points_by_year.length} year${points.points_by_year.length === 1 ? "" : "s"} played` : "No history yet"}
             </div>
           </div>
           <div style={{ textAlign: "right" }}>
             <div style={{ fontFamily: "var(--fd)", fontSize: 22, fontWeight: 900, color: "var(--red)" }}>
-              {stats?.career_points ?? "—"}
+              {points?.career_points ?? "—"}
             </div>
             <div style={{ fontSize: 10, color: "var(--ink3)" }}>PTS</div>
           </div>
