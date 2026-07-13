@@ -20,7 +20,7 @@ import { LoadingState, ErrorState, EmptyState } from "../components/StatusStates
 import { useQuery } from "../lib/useQuery";
 import {
   getTournamentByYear,
-  getTeamStandings,
+  getTeamStandingsWithBonus,
   getRoundsForTournament,
   getTeamRoster,
   getTeamPointsByRound,
@@ -34,7 +34,7 @@ type DrillTab = "standings" | "rounds" | "teams";
 async function loadTournament(year: number) {
   const tournament = await getTournamentByYear(year);
   const [standings, rounds, roster, pointsByRound, individualPoints] = await Promise.all([
-    getTeamStandings(tournament.tournament_id),
+    getTeamStandingsWithBonus(tournament.tournament_id),
     getRoundsForTournament(tournament.tournament_id),
     getTeamRoster(tournament.tournament_id),
     getTeamPointsByRound(tournament.tournament_id),
@@ -231,6 +231,11 @@ export function TournamentDetail() {
                             .map((r) => r.display_name)
                             .join(" · ")}
                         </div>
+                        {s.bonus_points > 0 && (
+                          <div className="standing-members">
+                            {s.tournament_points} pts + {s.bonus_points} bonus
+                          </div>
+                        )}
                       </div>
                       <div className="standing-pts">
                         <div className="standing-pts-num">{s.total_points}</div>

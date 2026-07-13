@@ -67,6 +67,49 @@ export async function getTeamStandings(tournamentId: number): Promise<TeamStandi
   return data ?? [];
 }
 
+export interface TeamStandingWithBonus {
+  tournament_id: number;
+  team_id: number;
+  team_name: string;
+  tournament_points: number;
+  bonus_points: number;
+  total_points: number;
+}
+
+// v_team_standings (a DB view) only totals round_results.tournament_points --
+// bonus_points is a separate table by design (see getBonusPointsRows), so it
+// has to be added on top here rather than in SQL. Bonus points are earned by
+// an individual player but count toward their TEAM's total, via that year's
+// roster.
+export async function getTeamStandingsWithBonus(tournamentId: number): Promise<TeamStandingWithBonus[]> {
+  const [standings, roster, bonusRows] = await Promise.all([
+    getTeamStandings(tournamentId),
+    getTeamRoster(tournamentId),
+    getBonusPointsRows(),
+  ]);
+  const teamByPlayer = new Map(roster.map((r) => [r.player_id, r.team_id]));
+  const bonusByTeam = new Map<number, number>();
+  for (const b of bonusRows) {
+    if (b.tournament_id !== tournamentId) continue;
+    const teamId = teamByPlayer.get(b.player_id);
+    if (teamId === undefined) continue;
+    bonusByTeam.set(teamId, (bonusByTeam.get(teamId) ?? 0) + b.points);
+  }
+  return standings
+    .map((s) => {
+      const bonus = bonusByTeam.get(s.team_id) ?? 0;
+      return {
+        tournament_id: s.tournament_id,
+        team_id: s.team_id,
+        team_name: s.team_name,
+        tournament_points: s.total_points,
+        bonus_points: Math.round(bonus * 100) / 100,
+        total_points: Math.round((s.total_points + bonus) * 100) / 100,
+      };
+    })
+    .sort((a, b) => b.total_points - a.total_points);
+}
+
 export interface RosterEntry {
   team_id: number;
   team_name: string;
@@ -277,7 +320,9 @@ export interface TeamRoundPoints {
 // Points-by-round per team, for a tournament's "how the lead changed" chart.
 // Teammates on a shared-award match all carry the same tournament_points value
 // (same caveat as v_team_standings), so matches are deduped by (match_id, team_id)
-// before summing — otherwise a 4-man team's award gets counted 4x.
+// before summing — otherwise a 4-man team's award gets counted 4x. Bonus
+// points are folded in at the round they were earned so the cumulative total
+// by the final round matches getTeamStandingsWithBonus.
 export async function getTeamPointsByRound(tournamentId: number): Promise<TeamRoundPoints[]> {
   const { data: rounds, error: roundsErr } = await supabase
     .from("rounds")
@@ -309,11 +354,13 @@ export async function getTeamPointsByRound(tournamentId: number): Promise<TeamRo
   const teamNameById = new Map((teams ?? []).map((t) => [t.team_id, t.team_name]));
 
   const teamByMatchPlayer = new Map<string, number>();
+  const teamByRoundPlayer = new Map<string, number>();
   const roundIdByMatchId = new Map<number, number>();
   for (const m of (matches ?? []) as any[]) {
     roundIdByMatchId.set(m.match_id, m.round_id);
     for (const p of m.match_participants ?? []) {
       teamByMatchPlayer.set(`${m.match_id}_${p.player_id}`, p.team_id);
+      teamByRoundPlayer.set(`${m.round_id}_${p.player_id}`, p.team_id);
     }
   }
 
@@ -332,6 +379,16 @@ export async function getTeamPointsByRound(tournamentId: number): Promise<TeamRo
 
     const totalKey = `${roundNumber}_${teamId}`;
     totals.set(totalKey, (totals.get(totalKey) ?? 0) + (r.tournament_points ?? 0));
+  }
+
+  const bonusRows = await getBonusPointsRows();
+  for (const b of bonusRows) {
+    if (b.tournament_id !== tournamentId) continue;
+    const teamId = teamByRoundPlayer.get(`${b.round_id}_${b.player_id}`);
+    const roundNumber = roundNumberByRoundId.get(b.round_id);
+    if (teamId === undefined || roundNumber === undefined) continue;
+    const totalKey = `${roundNumber}_${teamId}`;
+    totals.set(totalKey, (totals.get(totalKey) ?? 0) + b.points);
   }
 
   return [...totals.entries()]
@@ -369,6 +426,7 @@ export async function getTeamPointsByRound(tournamentId: number): Promise<TeamRo
 
 interface AdjustedPointsRow {
   match_id: number;
+  round_id: number;
   tournament_id: number;
   year: number;
   player_id: number;
@@ -471,6 +529,7 @@ async function computeIndividuallyAdjustedPoints(): Promise<AdjustedPointsRow[]>
 
   const rows = (data ?? []).map((row: any) => ({
     match_id: row.match_id,
+    round_id: row.matches?.round_id,
     player_id: row.player_id,
     display_name: row.players?.display_name ?? "Unknown",
     tournament_points: row.tournament_points ?? 0,
@@ -507,7 +566,7 @@ async function computeIndividuallyAdjustedPoints(): Promise<AdjustedPointsRow[]>
       // Either a single-participant (already individual) or already
       // per-player-distinct (e.g. Match Play win/loss) -- use as-is.
       for (const p of participants) {
-        out.push({ match_id: matchId, tournament_id: p.tournament_id, year: p.year, player_id: p.player_id, display_name: p.display_name, points: p.tournament_points });
+        out.push({ match_id: matchId, round_id: p.round_id, tournament_id: p.tournament_id, year: p.year, player_id: p.player_id, display_name: p.display_name, points: p.tournament_points });
       }
       continue;
     }
@@ -516,10 +575,43 @@ async function computeIndividuallyAdjustedPoints(): Promise<AdjustedPointsRow[]>
     const isShamble = shambleMatchIds.includes(matchId);
     for (const p of participants) {
       const weight = isShamble ? shambleWeights.get(`${matchId}_${p.player_id}`) ?? 1 / participants.length : 1 / participants.length;
-      out.push({ match_id: matchId, tournament_id: p.tournament_id, year: p.year, player_id: p.player_id, display_name: p.display_name, points: shared * weight });
+      out.push({ match_id: matchId, round_id: p.round_id, tournament_id: p.tournament_id, year: p.year, player_id: p.player_id, display_name: p.display_name, points: shared * weight });
     }
   }
   return out;
+}
+
+// Bonus points (Low Net, Top Individual Finisher, Most Holes Won, etc.) are
+// tracked in their own table, deliberately never silently blended into
+// round_results.tournament_points (per the schema's own comment). They ARE
+// already per-player -- no splitting needed -- so this just needs summing
+// alongside the individually-adjusted tournament points wherever a "points
+// won" total is shown, so the number on screen reconciles with the real
+// tournament outcome.
+interface BonusPointsRow {
+  player_id: number;
+  display_name: string;
+  round_id: number;
+  tournament_id: number;
+  year: number;
+  points: number;
+}
+
+async function getBonusPointsRows(): Promise<BonusPointsRow[]> {
+  const { data, error } = await supabase
+    .from("bonus_points")
+    .select("player_id, points, players(display_name), rounds(round_id, tournament_id, tournaments(year))");
+  if (error) throw error;
+  return (data ?? [])
+    .map((row: any) => ({
+      player_id: row.player_id,
+      display_name: row.players?.display_name ?? "Unknown",
+      round_id: row.rounds?.round_id,
+      tournament_id: row.rounds?.tournament_id,
+      year: row.rounds?.tournaments?.year,
+      points: row.points ?? 0,
+    }))
+    .filter((r) => r.tournament_id && r.year);
 }
 
 export interface PlayerAdjustedPoints {
@@ -529,18 +621,18 @@ export interface PlayerAdjustedPoints {
   career_points: number;
 }
 
-// Rescales each year's individually-adjusted points by (that year's total
-// points pool / the average pool size across years), so a year with a
-// bigger overall point pool (more rounds, more bonus categories, etc.)
-// doesn't automatically dominate the cross-year comparison. Splitting a
-// shared award preserves the pool total, so this is a fair normalization.
+// Rescales each year's individually-adjusted points (tournament + bonus) by
+// (that year's total points pool / the average pool size across years), so
+// a year with a bigger overall point pool doesn't automatically dominate the
+// cross-year comparison. Splitting a shared award preserves the pool total,
+// so this is a fair normalization.
 export async function getAdjustedPlayerPoints(): Promise<PlayerAdjustedPoints[]> {
-  const rows = await computeIndividuallyAdjustedPoints();
+  const [rows, bonusRows] = await Promise.all([computeIndividuallyAdjustedPoints(), getBonusPointsRows()]);
 
   const poolByYear = new Map<number, number>();
   const byPlayerYear = new Map<string, number>();
   const namesByPlayer = new Map<number, string>();
-  for (const r of rows) {
+  for (const r of [...rows, ...bonusRows]) {
     poolByYear.set(r.year, (poolByYear.get(r.year) ?? 0) + r.points);
     const key = `${r.player_id}_${r.year}`;
     byPlayerYear.set(key, (byPlayerYear.get(key) ?? 0) + r.points);
@@ -580,12 +672,12 @@ export interface PlayerTournamentPoints {
   points: number;
 }
 
-// Individually-adjusted points for one tournament (rule 1 only -- already
-// scoped to a single year, so the cross-year pool normalization doesn't
-// apply here).
+// Individually-adjusted points (tournament + bonus) for one tournament
+// (rule 1 only -- already scoped to a single year, so the cross-year pool
+// normalization doesn't apply here).
 export async function getIndividualPointsForTournament(tournamentId: number): Promise<PlayerTournamentPoints[]> {
-  const rows = await computeIndividuallyAdjustedPoints();
-  const scoped = rows.filter((r) => r.tournament_id === tournamentId);
+  const [rows, bonusRows] = await Promise.all([computeIndividuallyAdjustedPoints(), getBonusPointsRows()]);
+  const scoped = [...rows, ...bonusRows].filter((r) => r.tournament_id === tournamentId);
   if (scoped.length === 0) return [];
 
   const totals = new Map<number, { display_name: string; points: number }>();
@@ -876,28 +968,33 @@ export interface RecordCard {
 // Cross-format, all-time bests -- not tied to a specific recurring event, so
 // the "played more than once" rule doesn't apply the same way here. Points
 // here are individually-adjusted (a shared team award is split, not
-// double-counted); "Most Career Points" is also year-normalized since it
-// spans multiple tournaments.
+// double-counted) plus any bonus points earned that round; "Most Career
+// Points" is also year-normalized since it spans multiple tournaments.
 export async function getOverallRecords(): Promise<RecordCard[]> {
   const { data, error } = await supabase
-    .from("round_results")
-    .select("match_id, players(display_name), matches(rounds(event_name, tournaments(year)))");
+    .from("rounds")
+    .select("round_id, event_name, tournaments(year)");
   if (error) throw error;
 
-  const detailByMatch = new Map<number, { display_name: string; year: number; event_name: string }>();
+  const detailByRound = new Map<number, { year: number; event_name: string }>();
   for (const row of (data ?? []) as any[]) {
-    detailByMatch.set(row.match_id, {
-      display_name: row.players?.display_name ?? "Unknown",
-      year: row.matches?.rounds?.tournaments?.year,
-      event_name: row.matches?.rounds?.event_name ?? "",
-    });
+    detailByRound.set(row.round_id, { year: row.tournaments?.year, event_name: row.event_name ?? "" });
   }
 
   const cards: RecordCard[] = [];
-  const adjustedRows = await computeIndividuallyAdjustedPoints();
-  if (adjustedRows.length) {
-    const best = adjustedRows.reduce((a, b) => (b.points > a.points ? b : a));
-    const detail = detailByMatch.get(best.match_id);
+  const [adjustedRows, bonusRows] = await Promise.all([computeIndividuallyAdjustedPoints(), getBonusPointsRows()]);
+
+  const byRoundPlayer = new Map<string, { display_name: string; year: number; round_id: number; points: number }>();
+  for (const r of [...adjustedRows, ...bonusRows]) {
+    const key = `${r.round_id}_${r.player_id}`;
+    const entry = byRoundPlayer.get(key) ?? { display_name: r.display_name, year: r.year, round_id: r.round_id, points: 0 };
+    entry.points += r.points;
+    byRoundPlayer.set(key, entry);
+  }
+
+  if (byRoundPlayer.size) {
+    const best = [...byRoundPlayer.values()].reduce((a, b) => (b.points > a.points ? b : a));
+    const detail = detailByRound.get(best.round_id);
     cards.push({
       label: "Most Points — Single Round",
       value: `${Math.round(best.points * 100) / 100} pts`,

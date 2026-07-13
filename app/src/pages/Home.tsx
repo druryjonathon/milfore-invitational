@@ -1,13 +1,13 @@
 import { Link } from "react-router-dom";
 import { ErrorState, EmptyState } from "../components/StatusStates";
 import { useQuery } from "../lib/useQuery";
-import { getTournaments, getTeamStandings } from "../lib/queries";
+import { getTournaments, getTeamStandingsWithBonus } from "../lib/queries";
 import { CalendarIcon, UsersIcon, StarIcon } from "../components/icons";
 
 async function loadHomeSummary() {
   const tournaments = await getTournaments(); // ordered by year desc
   const latest = tournaments[0] ?? null;
-  const standings = latest ? await getTeamStandings(latest.tournament_id) : [];
+  const standings = latest ? await getTeamStandingsWithBonus(latest.tournament_id) : [];
   return { tournaments, latest, winner: standings[0] ?? null };
 }
 
